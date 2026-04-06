@@ -72,6 +72,20 @@ class HealthScoreResponse(BaseModel):
             "individual signal confidence scores."
         ),
     )
+    factors: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Top 3 plain-English factors driving the score up or down, "
+            "e.g. 'NDVI trending down -12% over 2 years'."
+        ),
+    )
+    recommendations: list[str] = Field(
+        default_factory=list,
+        description=(
+            "2–3 actionable suggestions based on the signal scores, "
+            "e.g. 'Consider drought-resistant crop varieties'."
+        ),
+    )
     signals: SignalsContainer = Field(
         ...,
         description="All five raw signal results with individual scores and data",

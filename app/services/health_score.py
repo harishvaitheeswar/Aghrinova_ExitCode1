@@ -203,6 +203,194 @@ def _classify_status(score: float) -> str:
     return "At Risk"
 
 
+def _generate_recommendations(
+    composite: float,
+    ndvi_score: float,
+    rainfall_score: float,
+    soil_score: float,
+    soil_conf: float,
+    temp_score: float,
+) -> list[str]:
+    """
+    Generate 2–3 actionable, plain-English recommendations from signal scores.
+
+    Rules (evaluated in order, capped at 3):
+      1. Low NDVI + low rainfall           → drought-resistant varieties
+      2. Low temperature score              → irrigation during heat stress
+      3. Low NDVI (standalone)              → vegetation restoration
+      4. Low rainfall (standalone)          → water harvesting / irrigation
+      5. Poor soil (only if confidence > 0) → soil amendment
+      6. High overall score                 → positive outlook
+    """
+    recs: list[str] = []
+
+    # 1. Combined drought signal
+    if ndvi_score < 50 and rainfall_score < 50:
+        recs.append(
+            "Consider drought-resistant crop varieties — both vegetation "
+            "health and rainfall are below average."
+        )
+
+    # 2. Temperature / heat-stress
+    if temp_score < 60:
+        recs.append(
+            "Plan irrigation during March–May heat stress period to "
+            "protect crops from high-temperature damage."
+        )
+
+    # 3. NDVI alone (skip if already covered by #1)
+    if ndvi_score < 50 and rainfall_score >= 50 and len(recs) < 3:
+        recs.append(
+            "Vegetation cover is declining — explore cover cropping or "
+            "agroforestry to restore green cover."
+        )
+
+    # 4. Rainfall alone (skip if already covered by #1)
+    if rainfall_score < 50 and ndvi_score >= 50 and len(recs) < 3:
+        recs.append(
+            "Rainfall is below normal — invest in rainwater harvesting "
+            "or drip irrigation to secure water supply."
+        )
+
+    # 5. Soil quality (skip when confidence is 0 → no soil data)
+    if soil_conf > 0 and soil_score < 50 and len(recs) < 3:
+        recs.append(
+            "Soil quality is limited — consider lime or gypsum amendments "
+            "and organic mulching to improve fertility."
+        )
+
+    # 6. Positive message when things look good
+    if composite > 75 and len(recs) < 3:
+        recs.append(
+            "Land is in good health — suitable for high-value crop "
+            "cultivation such as horticulture or spice farming."
+        )
+
+    # Ensure at least one generic recommendation if nothing matched
+    if not recs:
+        recs.append(
+            "Monitor seasonal changes and re-check the health score "
+            "before each cropping cycle for best results."
+        )
+
+    return recs[:3]
+
+
+def _generate_factors(
+    ndvi_score: float,
+    ndvi_data: dict | None,
+    rainfall_score: float,
+    rainfall_data: dict | None,
+    soil_score: float,
+    soil_data: dict | None,
+    temp_score: float,
+    temp_data: dict | None,
+) -> list[str]:
+    """
+    Build a list of plain-English factor strings describing what is
+    driving the composite score up or down.  Returns the top 3 factors
+    sorted by absolute impact (weight × deviation from 100).
+
+    Each entry is a tuple (abs_impact, text) so we can rank them.
+    """
+    candidates: list[tuple[float, str]] = []
+
+    # ── NDVI factors ──────────────────────────────────────────────────────────
+    if ndvi_data:
+        trend_slope = ndvi_data.get("trend_slope")
+        two_year_mean = ndvi_data.get("two_year_mean")
+
+        if trend_slope is not None and two_year_mean and two_year_mean > 0:
+            pct_change = round(trend_slope / two_year_mean * 100, 1)
+            direction = "up" if pct_change >= 0 else "down"
+            candidates.append((
+                abs(100 - ndvi_score) * WEIGHT_NDVI,
+                f"NDVI trending {direction} {pct_change:+.1f}% over 2 years",
+            ))
+        elif two_year_mean is not None:
+            label = "strong" if two_year_mean >= 0.6 else "moderate" if two_year_mean >= 0.4 else "weak"
+            candidates.append((
+                abs(100 - ndvi_score) * WEIGHT_NDVI,
+                f"Vegetation health is {label} (mean NDVI {two_year_mean:.2f})",
+            ))
+    elif ndvi_score == 0.0:
+        candidates.append((100 * WEIGHT_NDVI, "NDVI data unavailable"))
+
+    # ── Rainfall factors ──────────────────────────────────────────────────────
+    if rainfall_data:
+        deviation = rainfall_data.get("deviation_from_normal")
+        flag = rainfall_data.get("surplus_or_deficit")
+
+        if deviation is not None and flag:
+            abs_dev = abs(round(deviation, 1))
+            if flag == "deficit":
+                candidates.append((
+                    abs(100 - rainfall_score) * WEIGHT_RAINFALL,
+                    f"Rainfall {abs_dev}% below seasonal normal",
+                ))
+            elif flag == "surplus":
+                candidates.append((
+                    abs(100 - rainfall_score) * WEIGHT_RAINFALL,
+                    f"Rainfall {abs_dev}% above seasonal normal",
+                ))
+            else:
+                candidates.append((
+                    abs(100 - rainfall_score) * WEIGHT_RAINFALL,
+                    f"Rainfall within {abs_dev}% of seasonal normal",
+                ))
+    elif rainfall_score == 0.0:
+        candidates.append((100 * WEIGHT_RAINFALL, "Rainfall data unavailable"))
+
+    # ── Temperature factors ───────────────────────────────────────────────────
+    if temp_data:
+        heat_count = temp_data.get("heat_stress_event_count", 0)
+        total_months = len(temp_data.get("monthly_trend", []))
+
+        if heat_count > 0:
+            candidates.append((
+                abs(100 - temp_score) * WEIGHT_TEMPERATURE,
+                f"Temperature stress detected in {heat_count} month{'s' if heat_count != 1 else ''}",
+            ))
+        elif total_months > 0:
+            candidates.append((
+                abs(100 - temp_score) * WEIGHT_TEMPERATURE,
+                "No temperature stress detected",
+            ))
+    elif temp_score == 0.0:
+        candidates.append((100 * WEIGHT_TEMPERATURE, "Temperature data unavailable"))
+
+    # ── Soil factors ──────────────────────────────────────────────────────────
+    if soil_data:
+        ph = soil_data.get("ph")
+        oc = soil_data.get("organic_carbon")
+        soil_type = soil_data.get("soil_type", "")
+
+        parts: list[str] = []
+        if ph is not None:
+            distance = abs(ph - 6.5)
+            if distance <= 1.0:
+                parts.append(f"near-ideal pH {ph:.1f}")
+            else:
+                parts.append(f"pH {ph:.1f} ({'acidic' if ph < 6.5 else 'alkaline'})")
+        if oc is not None:
+            level = "high" if oc >= 2.0 else "moderate" if oc >= 1.0 else "low"
+            parts.append(f"{level} organic carbon")
+        if soil_type:
+            parts.append(f"{soil_type} texture")
+
+        if parts:
+            candidates.append((
+                abs(100 - soil_score) * WEIGHT_SOIL,
+                "Soil profile: " + ", ".join(parts),
+            ))
+    elif soil_score == 0.0:
+        candidates.append((100 * WEIGHT_SOIL, "Soil data unavailable"))
+
+    # ── Sort by absolute impact (descending) and return top 3 ─────────────────
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    return [text for _, text in candidates[:3]]
+
+
 # ── Parallel service callers (with error isolation) ───────────────────────────
 
 
@@ -370,12 +558,32 @@ async def compute_health_score(
             + "; ".join(failures)
         )
 
+    # ── Generate top-3 plain-English factors ────────────────────────────────────
+    factors = _generate_factors(
+        ndvi_score=ndvi_score, ndvi_data=ndvi_data,
+        rainfall_score=rainfall_score, rainfall_data=rainfall_data,
+        soil_score=soil_score, soil_data=soil_data,
+        temp_score=temp_score, temp_data=temp_data,
+    )
+
+    # ── Generate 2–3 actionable recommendations ────────────────────────────────
+    recommendations = _generate_recommendations(
+        composite=composite,
+        ndvi_score=ndvi_score,
+        rainfall_score=rainfall_score,
+        soil_score=soil_score,
+        soil_conf=soil_conf,
+        temp_score=temp_score,
+    )
+
     return {
         "lat": lat,
         "lng": lng,
         "score": composite,
         "status": status,
         "confidence_score": overall_confidence,
+        "factors": factors,
+        "recommendations": recommendations,
         "signals": {
             "ndvi": {
                 "score": ndvi_score,
