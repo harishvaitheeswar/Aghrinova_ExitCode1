@@ -6,7 +6,7 @@ FastAPI application factory for the Landroid Land Intelligence Platform.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routes import health, soil, osm, ndvi, rainfall, temperature, health_score
+from app.routes import health, soil, osm, ndvi, rainfall, temperature, health_score, canopy
 
 # ── Application factory ───────────────────────────────────────────────────────
 
@@ -40,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(rainfall.router)
     app.include_router(temperature.router)
     app.include_router(health_score.router)
+    app.include_router(canopy.router)
 
     return app
 

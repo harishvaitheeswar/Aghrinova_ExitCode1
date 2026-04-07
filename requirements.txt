@@ -10,3 +10,6 @@ xarray>=2024.3.0
 zarr>=2.17.0
 planetary-computer>=1.0.0
 numpy>=1.26.0
+opencv-python-headless>=4.9.0
+rasterio>=1.3.0
+python-multipart>=0.0.9
