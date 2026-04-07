@@ -1,8 +1,8 @@
 """
 app/services/canopy.py
-Tree canopy detection service using OpenCV and rasterio.
+Tree canopy detection service using OpenCV and Pillow.
 
-Processes uploaded Birdscale GeoTIFF orthomosaics to count tree canopies
+Processes uploaded Birdscale drone orthomosaics to count tree canopies
 via two methods (SimpleBlobDetector and watershed segmentation) and returns
 whichever produces a more confident result.
 """
@@ -15,8 +15,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-import rasterio
-from rasterio.transform import array_bounds
+from PIL import Image
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -26,51 +25,19 @@ SQ_METRES_PER_ACRE = 4046.86  # Conversion factor
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _read_geotiff(file_bytes: bytes) -> tuple[np.ndarray, Optional[dict]]:
+def _read_image(file_bytes: bytes) -> np.ndarray:
     """
-    Read a GeoTIFF from raw bytes and return (RGB uint8 array, geo_info dict).
+    Read an image from raw bytes using Pillow and return an RGB uint8 array.
 
-    `geo_info` contains `transform`, `crs`, `width`, `height` when available;
-    otherwise ``None``.
-
-    Raises ``ValueError`` if the file cannot be read as a valid raster.
+    Raises ``ValueError`` if the file cannot be opened as a valid image.
     """
     try:
-        with rasterio.open(io.BytesIO(file_bytes)) as src:
-            # Extract RGB bands (1, 2, 3).  Fall back to single-band → grey.
-            band_count = src.count
-            if band_count >= 3:
-                r = src.read(1)
-                g = src.read(2)
-                b = src.read(3)
-            elif band_count == 1:
-                r = g = b = src.read(1)
-            else:
-                r = src.read(1)
-                g = src.read(min(2, band_count))
-                b = src.read(min(3, band_count))
-
-            rgb = np.dstack([r, g, b])
-
-            # Normalise to uint8 if necessary
-            if rgb.dtype != np.uint8:
-                mn, mx = rgb.min(), rgb.max()
-                if mx > mn:
-                    rgb = ((rgb - mn) / (mx - mn) * 255).astype(np.uint8)
-                else:
-                    rgb = np.zeros_like(rgb, dtype=np.uint8)
-
-            geo_info = {
-                "transform": src.transform,
-                "crs": src.crs,
-                "width": src.width,
-                "height": src.height,
-            }
-
-            return rgb, geo_info
-
-    except rasterio.errors.RasterioIOError as exc:
-        raise ValueError(f"Invalid GeoTIFF file: {exc}") from exc
+        img = Image.open(io.BytesIO(file_bytes))
+        img = img.convert("RGB")
+        rgb = np.array(img, dtype=np.uint8)
+        return rgb
+    except Exception as exc:
+        raise ValueError(f"Invalid image file: {exc}") from exc
 
 
 def _downsample(image: np.ndarray) -> tuple[np.ndarray, float]:
@@ -88,39 +55,6 @@ def _downsample(image: np.ndarray) -> tuple[np.ndarray, float]:
     new_h = int(h * scale)
     resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
     return resized, scale
-
-
-def _compute_image_area_acres(geo_info: Optional[dict]) -> Optional[float]:
-    """
-    Estimate the ground area (acres) covered by the raster using its
-    affine transform and CRS.  Returns ``None`` if metadata is unavailable
-    or the CRS is geographic (degrees).
-    """
-    if geo_info is None or geo_info["crs"] is None:
-        return None
-
-    transform = geo_info["transform"]
-    w = geo_info["width"]
-    h = geo_info["height"]
-
-    # Compute bounds and approximate area
-    bounds = array_bounds(h, w, transform)
-    x_extent = abs(bounds[2] - bounds[0])
-    y_extent = abs(bounds[3] - bounds[1])
-
-    crs = geo_info["crs"]
-    if crs.is_geographic:
-        # Approximate metres from degrees at the centroid latitude
-        mid_lat = (bounds[1] + bounds[3]) / 2.0
-        lat_rad = math.radians(mid_lat)
-        m_per_deg_lon = 111_320 * math.cos(lat_rad)
-        m_per_deg_lat = 110_540
-        area_sqm = (x_extent * m_per_deg_lon) * (y_extent * m_per_deg_lat)
-    else:
-        # Assume projected CRS in metres
-        area_sqm = x_extent * y_extent
-
-    return area_sqm / SQ_METRES_PER_ACRE
 
 
 # ── Blob detection ────────────────────────────────────────────────────────────
@@ -254,7 +188,7 @@ async def detect_canopies(file_bytes: bytes) -> dict:
     """
     Full canopy detection pipeline.
 
-    1. Read GeoTIFF → RGB
+    1. Read image → RGB
     2. Downsample if needed
     3. Convert to greyscale, Gaussian blur
     4. Run blob detection **and** watershed segmentation
@@ -262,12 +196,12 @@ async def detect_canopies(file_bytes: bytes) -> dict:
     6. Build and return the response dict
 
     Raises:
-        ValueError   – invalid GeoTIFF
+        ValueError   – invalid image file
         RuntimeError – OpenCV processing failure
     """
 
     # ── 1. Read ───────────────────────────────────────────────────────────────
-    rgb, geo_info = _read_geotiff(file_bytes)
+    rgb = _read_image(file_bytes)
 
     # ── 2. Downsample ─────────────────────────────────────────────────────────
     rgb, scale = _downsample(rgb)
@@ -308,17 +242,12 @@ async def detect_canopies(file_bytes: bytes) -> dict:
     mean_area = float(np.mean(sizes)) if sizes else 0.0
     stressed = _stressed_count(sizes)
 
-    # Density per acre
-    area_acres = _compute_image_area_acres(geo_info)
-    if area_acres and area_acres > 0:
-        density = round(total_count / area_acres, 2)
-    else:
-        # Fallback: estimate from pixel area (assume 0.1 m/px typical drone GSD)
-        h, w = rgb.shape[:2]
-        pixel_area_m2 = (0.1 / scale) ** 2  # Account for downsampling
-        total_area_m2 = h * w * pixel_area_m2
-        total_area_acres = total_area_m2 / SQ_METRES_PER_ACRE
-        density = round(total_count / total_area_acres, 2) if total_area_acres > 0 else 0.0
+    # Density per acre — estimate from pixel area (assume 0.1 m/px typical drone GSD)
+    h, w = rgb.shape[:2]
+    pixel_area_m2 = (0.1 / scale) ** 2  # Account for downsampling
+    total_area_m2 = h * w * pixel_area_m2
+    total_area_acres = total_area_m2 / SQ_METRES_PER_ACRE
+    density = round(total_count / total_area_acres, 2) if total_area_acres > 0 else 0.0
 
     return {
         "total_canopy_count": total_count,
